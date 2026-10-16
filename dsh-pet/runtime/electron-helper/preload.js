@@ -37,6 +37,17 @@ contextBridge.exposeInMainWorld('petBridge', {
   openDshSite(url) {
     ipcRenderer.send('pet:open-site', { url });
   },
+  // ---- 监控底座（任务管理器五项）----
+  // 订阅主进程 2s 一拍的系统指标（CPU/内存/磁盘/网络/GPU）；返回退订函数（sprite 重建时回收）
+  onMetrics(cb) {
+    const handler = (event, m) => cb(m);
+    ipcRenderer.on('pet:metrics', handler);
+    return () => ipcRenderer.removeListener('pet:metrics', handler);
+  },
+  // 点击底座：主进程打开系统任务管理器（Windows taskmgr.exe / macOS 活动监视器）
+  openTaskManager() {
+    ipcRenderer.send('pet:open-taskmgr');
+  },
   // ---- 宠物间碰撞（跨窗 broker）----
   reportFlight(state) {
     ipcRenderer.send('pet:report-flight', state);

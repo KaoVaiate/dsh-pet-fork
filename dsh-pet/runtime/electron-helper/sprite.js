@@ -164,6 +164,9 @@ class PetSprite {
     this.el.appendChild(this.tip);
     this.el.appendChild(stage);
     rootEl.appendChild(this.el);
+    // 监控底座（任务管理器五项）：必须在 position() 首帧上报前创建——
+    // 开启底座时 sendBounds 按 dock.groundLift 抬升窗口，晚建会闪一下。
+    this.dock = new PetDock(this);
     this.position();
 
     // 事件（与浏览器同一套：pointerdown/move、click、window pointerup/cancel）
@@ -245,6 +248,10 @@ class PetSprite {
     this.inputRegionMutation.disconnect();
     this.inputRegionResize.disconnect();
     this.inputRegionElements.clear();
+    if (this.dock) {
+      this.dock.dispose();
+      this.dock = null;
+    }
     if (this.bubbleTimer !== null) window.clearTimeout(this.bubbleTimer);
     if (this.whisperTimer !== null) window.clearTimeout(this.whisperTimer);
     if (this.workTimer !== null) window.clearTimeout(this.workTimer);
@@ -260,11 +267,26 @@ class PetSprite {
     this.el.remove();
   }
 
+  /**
+   * 当前窗口矩形（**视口相对坐标**）= 宠物包围盒 + 四周外扩余量。
+   * 底座开启时窗口整体上抬 dock.groundLift、高度补同值——宠物贴地时底座也完整可见
+   * （几何推导见 dock.js 文件头）。sendBounds / 菜单夹取 / 提示摆位都从这里取，唯一收口。
+   */
+  winBox() {
+    // 底座隐藏时抬升必须归零：窗口几何恢复到无底座形态（开关零回归）
+    const lift = this.dock && this.dock.isVisible() ? this.dock.groundLift : 0;
+    return {
+      x: this.pos.x - this.margin.l,
+      y: this.pos.y - this.margin.t - lift,
+      w: this.size + this.margin.l + this.margin.r,
+      h: this.winH + this.margin.t + this.margin.b + lift,
+    };
+  }
+
   // 目标包围盒左上角（视口相对坐标）→ 移动窗口：窗口 = sprite + 四周外扩余量
   // （sprite 钉在窗口 (margin.l, margin.t)，气泡/弹窗显示在余量里）。
   // setContentBounds 要**屏幕**坐标：pos 是视口（桌面外接矩形）相对坐标，先加 VIEW.x/y
-  // 再统一 ×scale 回物理像素（§3.5 IPC 收口）——主进程收到的数字与线性化旧行为逐位一致，
-  // 主进程侧（bounds/去重/碰撞 broker）完全不用改。
+  // 再统一 ×scale 回物理像素（§3.5 IPC 收口）——底座关闭时主进程收到的数字与旧行为逐位一致。
   sendBounds(px, py) {
     this.pos = { x: Math.round(px), y: Math.round(py) };
     window.__dshPetDebug.dragPos = { x: this.pos.x, y: this.pos.y };
@@ -273,11 +295,14 @@ class PetSprite {
       // （此前只有 report-flight 带尺寸，从没飞过的宠物 size=0 被碰撞检测直接跳过）；
       // vx/vy 带当前速度——飞行中实时值、静止/拖拽 = 0，避免落地后残留上次飞行速度干扰碰撞动量。
       const fly = this.throwState;
+      const box = this.winBox();
       window.petBridge.setBounds(
-        toScreen(this.pos.x - this.margin.l + VIEW.x),
-        toScreen(this.pos.y - this.margin.t + VIEW.y),
-        toScreen(this.size + this.margin.l + this.margin.r),
-        toScreen(this.winH + this.margin.t + this.margin.b),
+        toScreen(box.x + VIEW.x),
+        toScreen(box.y + VIEW.y),
+        toScreen(box.w),
+        toScreen(box.h),
+        // 碰撞站场仍用宠物包围盒的**逻辑位置**（不含底座视觉抬升）：抬升量仅尺寸的约 4%，
+        // 宠物间碰撞近似不受影响，移动/抛掷/夹取模型保持不变。
         toScreen(this.pos.x), // 包围盒左上角（碰撞站场用：窗口坐标 ≠ 包围盒坐标）
         toScreen(this.pos.y),
         toScreen(this.size),
@@ -1000,7 +1025,8 @@ class PetSprite {
   syncInputRegions() {
     if (!window.petBridge || !window.petBridge.setInputRegions) return;
     const rects = [];
-    const controls = [...document.querySelectorAll('.dsh-pet-menu-column, .dsh-pet-chat')];
+    // 底座与菜单/聊天框同级上报：光标在底座矩形内时主进程兜底通道放行交互，其余透明区继续穿透
+    const controls = [...document.querySelectorAll('.dsh-pet-menu-column, .dsh-pet-chat, .pet-dock')];
     for (const el of this.inputRegionElements) {
       if (!controls.includes(el)) {
         this.inputRegionResize.unobserve(el);
@@ -1059,10 +1085,11 @@ class PetSprite {
     if (this.tip.textContent !== this.pet.name) this.tip.textContent = this.pet.name;
     const cursor = this.tipCursor;
     if (cursor) {
-      const winX = this.pos.x - this.margin.l;
-      const winY = this.pos.y - this.margin.t;
-      const winW = this.size + this.margin.l + this.margin.r;
-      const winH = this.winH + this.margin.t + this.margin.b;
+      const wb = this.winBox();
+      const winX = wb.x;
+      const winY = wb.y;
+      const winW = wb.w;
+      const winH = wb.h;
       // 允许显示范围 = 窗口 ∩ 光标所在屏的工作区，两者必须取交集：
       // 只按窗口夹，窗口能贴到屏幕外，提示会被画到看不见的地方；只按工作区夹，提示会落到窗口外
       // （index.html 的 html,body 是 overflow:hidden，一样看不见）。
@@ -1106,17 +1133,21 @@ class PetSprite {
     const r = this.hitRect;
     // forwarded 事件坐标以窗口为原点（与页坐标一致）；转换到 sprite 坐标需扣减窗口余量；
     // 异常时退回屏幕坐标 − 窗口屏幕位置推导（hitRect/pos 均为 CSS 系）：屏幕坐标 ÷scale 后
-    // 减去窗口屏幕原点（CSS 系）即窗口内坐标
-    const wx = Number.isFinite(e.clientX) ? e.clientX : toLocal(e.screenX) - (this.pos.x + VIEW.x - this.margin.l);
-    const wy = Number.isFinite(e.clientY) ? e.clientY : toLocal(e.screenY) - (this.pos.y + VIEW.y - this.margin.t);
+    // 减去窗口屏幕原点（CSS 系）即窗口内坐标。窗口原点统一走 winBox()——底座开启时窗口
+    // 整体上抬了 groundLift，用旧公式会把抬升量算错。
+    const wb0 = this.winBox();
+    const wx = Number.isFinite(e.clientX) ? e.clientX : toLocal(e.screenX) - (wb0.x + VIEW.x);
+    const wy = Number.isFinite(e.clientY) ? e.clientY : toLocal(e.screenY) - (wb0.y + VIEW.y);
     const px = wx - this.margin.l;
     const py = wy - this.margin.t;
     const inBody = px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+    // 底座是身体之外的第二个可交互区（点击打开任务管理器）；拖拽中不参与判定（拖拽本来就强制可交互）
+    const inDock = !this.dragState.active && this.dock !== null && this.dock.isVisible() && this.dock.hitTest(wx, wy);
     // 光标位置存**视口坐标**（窗口原点 + 窗口内坐标）：窗口随宠物移动时贴光标不会漂，见 renderTip。
     // 必须在 setTip 之前更新：setTip 变显隐时会立刻渲染一次，晚一步就会用上一次的光标摆位。
-    if (inBody) this.tipCursor = { x: this.pos.x - this.margin.l + wx, y: this.pos.y - this.margin.t + wy };
-    this.setInteractive(inBody);
-    // 悬浮提示与可交互判定同源（同一个 inBody）：光标进身体 → 提示出现，离开 → 收起
+    if (inBody) this.tipCursor = { x: wb0.x + wx, y: wb0.y + wy };
+    this.setInteractive(inBody || inDock);
+    // 悬浮提示只跟身体走（同一个 inBody）：光标进身体 → 提示出现，离开/进底座 → 收起
     this.setTip(inBody);
     // 跟随光标：位置依赖光标，所以每次移动都得重摆一次（setTip 只在显隐变化时才渲染）
     if (this.tipOn) this.renderTip();
@@ -1152,10 +1183,11 @@ class PetSprite {
     // 不属于任何显示器的区域（看不见）；菜单本来也不该跨屏显示。
     const area = S.resolveRect(WORK_AREAS, this.pos.x + this.halfW, this.pos.y + this.halfH);
     if (!area) return null;
-    const winX = this.pos.x + VIEW.x - this.margin.l;
-    const winY = this.pos.y + VIEW.y - this.margin.t;
-    const winW = this.size + this.margin.l + this.margin.r;
-    const winH = this.winH + this.margin.t + this.margin.b;
+    const wb = this.winBox();
+    const winX = wb.x + VIEW.x;
+    const winY = wb.y + VIEW.y;
+    const winW = wb.w;
+    const winH = wb.h;
     const ax = area.x + VIEW.x;
     const ay = area.y + VIEW.y;
     const vx0 = Math.max(ax, winX);
@@ -1182,6 +1214,8 @@ class PetSprite {
     tools.push(
       { label: '碎碎念', action: 'whisper' },
       { label: '对话', action: 'chat' },
+      // 监控底座开关：label 随当前状态变（点击整块底座可打开系统任务管理器）
+      { label: this.dock && this.dock.isVisible() ? '隐藏监控底座' : '显示监控底座', action: 'toggle-dock' },
       { label: '回到初始位置', action: 'home' },
       // 改配置文件后免去回设置页点保存：请宿主重启桌面 Helper（全部桌面宠物窗口按最新配置重建）。
       // 放在最后：它是"重新加载"这类维护动作，与上面几个宠物互动项语义不同。
@@ -1229,6 +1263,10 @@ class PetSprite {
     }
     if (leaf.action === 'chat') {
       this.showChatFromMenu(); // 打开对话弹窗（记忆经 host /chat 读写，浏览器/桌面同一实例共享）
+      return;
+    }
+    if (leaf.action === 'toggle-dock') {
+      if (this.dock) this.dock.toggle(); // 显示/隐藏监控底座（偏好 localStorage 记忆）
       return;
     }
     if (leaf.action === 'home') {
@@ -1368,6 +1406,8 @@ class PetSprite {
     const slot =
       workTerminal && workOn ? 'work' : whisperOn ? 'whisper' : balanceOn ? 'balance' : workOn ? 'work' : 'none';
     const whisperImg = slot === 'whisper' ? S.createMemeImage(this.whisperImage, BASE, this.assetRoot) : null;
+    // 配图同样落到监控底座上（图片素材：碎碎念/对话带图时），与气泡单槽优先级同一判定
+    if (this.dock) this.dock.syncImage(slot === 'whisper' ? this.whisperImage : '');
     this.bubble.classList.toggle(
       'is-whisper',
       // 余额「文字说明」（不可用状态）同样要换行变体：默认 nowrap 会把长文案顶出宠物宽度

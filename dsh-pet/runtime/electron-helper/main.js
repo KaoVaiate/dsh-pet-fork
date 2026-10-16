@@ -47,7 +47,8 @@ try {
 }
 const { app, BrowserWindow, ipcMain, screen, shell, protocol } = electronApi;
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
+const os = require('node:os');
 const { readFileSync, writeFileSync } = require('node:fs');
 const fsPromises = require('node:fs/promises');
 // 点击穿透兜底通道的纯判定（不依赖 Electron 的 forward 鼠标钩子；见文件头注释）
@@ -391,6 +392,141 @@ function deskGeometry() {
   return buildDeskGeometry(screen.getAllDisplays(), screen.getPrimaryDisplay().id, process.platform);
 }
 
+// ---------- 系统监控指标（宠物底座：任务管理器五项 CPU / 内存 / 磁盘 / 网络 / GPU） ----------
+//
+// CPU / 内存走 Node 原生（os.cpus() 时间片差值 / totalmem-freemem），主进程 2s 一拍；
+// 磁盘 / 网络 / GPU 没有可移植的原生 API，由一个**常驻 PowerShell** 子进程每 2s 采样
+// Win32_PerfFormattedData_* 性能计数器（CIM 类名是英文的，不受中文系统计数器本地化影响），
+// 以 JSON 行回传，主进程合并后广播 pet:metrics 给所有宠物窗口：
+//   磁盘 = PhysicalDisk(_Total)：PercentDiskTime（活动时间，钳到 100）+ 读写字节速率
+//   网络 = Tcpip_NetworkInterface 各实体网卡上下行求和（剔除环回/6to4/Teredo 等隧道）
+//   GPU  = GPUPerformanceCounters_GPUEngine 全部 engtype_3D 引擎利用率求和（任务管理器 GPU 列口径）
+// 常驻而不是每拍 spawn：PowerShell 冷启动 200~400ms，每 2s 拉一次纯属浪费。
+// 非 Windows 不起该子进程：只广播 CPU/内存，三项给 null，渲染端把对应格子画成「—」。
+let perfSample = { diskPct: null, diskBytes: 0, netUp: 0, netDown: 0, gpu: null };
+let perfProc = null;
+
+function numOr0(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+function clampPct(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function startPerfWorker() {
+  if (process.platform !== 'win32') return;
+  const script = [
+    "$ErrorActionPreference='SilentlyContinue'",
+    'while ($true) {',
+    '  $diskPct = 0; $diskBytes = 0',
+    "  $d = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk -Filter \"Name='_Total'\"",
+    '  if ($d) {',
+    '    $diskPct = [int64]$d.PercentDiskTime',
+    '    if ($diskPct -gt 100) { $diskPct = 100 }',
+    '    if ($diskPct -lt 0) { $diskPct = 0 }',
+    '    $diskBytes = [int64]$d.DiskReadBytesPersec + [int64]$d.DiskWriteBytesPersec',
+    '  }',
+    '  $netUp = 0; $netDown = 0',
+    "  Get-CimInstance Win32_PerfFormattedData_Tcpip_NetworkInterface | Where-Object { $_.Name -notmatch 'Loopback|isatap|Teredo|6to4|IPHTTPS' } | ForEach-Object {",
+    '    $netUp += [int64]$_.BytesSentPersec',
+    '    $netDown += [int64]$_.BytesReceivedPersec',
+    '  }',
+    '  $gpu = 0',
+    "  Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine | Where-Object { $_.Name -like '*engtype_3D' } | ForEach-Object { $gpu += [int]$_.UtilizationPercentage }",
+    '  if ($gpu -gt 100) { $gpu = 100 }',
+    '  $o = [pscustomobject]@{ diskPct = $diskPct; diskBytes = $diskBytes; netUp = $netUp; netDown = $netDown; gpu = $gpu }',
+    '  Write-Output ($o | ConvertTo-Json -Compress)',
+    '  Start-Sleep -Milliseconds 2000',
+    '}',
+  ].join('\r\n');
+  let buf = '';
+  const child = spawn(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+    { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] },
+  );
+  perfProc = child;
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    buf += chunk;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line.startsWith('{')) continue;
+      try {
+        const o = JSON.parse(line);
+        perfSample = {
+          diskPct: clampPct(o.diskPct),
+          diskBytes: numOr0(o.diskBytes),
+          netUp: numOr0(o.netUp),
+          netDown: numOr0(o.netDown),
+          gpu: clampPct(o.gpu),
+        };
+      } catch {
+        /* 半行/坏行：丢掉等下一拍 */
+      }
+    }
+  });
+  child.on('error', () => {});
+  child.on('exit', () => {
+    // 异常退出（被杀/PS 不可用）：3s 后尝试重拉一次；正常退出（before-quit kill）不再重启
+    if (perfProc !== child) return;
+    perfProc = null;
+    setTimeout(startPerfWorker, 3000).unref?.();
+  });
+  app.once('before-quit', () => {
+    perfProc = null; // 标记为正常退出，阻止 exit 后重启
+    try {
+      child.kill();
+    } catch {
+      /* ignore */
+    }
+  });
+}
+
+/** os.cpus() 累计时间片快照：idle/total，两次差值即该区间 CPU 占用率 */
+function cpuTimesSnapshot() {
+  let idle = 0;
+  let total = 0;
+  for (const c of os.cpus()) {
+    for (const k of Object.keys(c.times)) total += c.times[k];
+    idle += c.times.idle;
+  }
+  return { idle, total };
+}
+
+/** 把一拍指标广播给所有宠物窗口（渲染端底座订阅 pet:metrics） */
+function broadcastMetrics(m) {
+  for (const win of windows.values()) {
+    if (!win.isDestroyed()) win.webContents.send('pet:metrics', m);
+  }
+}
+
+function startMetricsLoop() {
+  let prev = cpuTimesSnapshot();
+  setInterval(() => {
+    const cur = cpuTimesSnapshot();
+    const totalDt = cur.total - prev.total;
+    const cpu = totalDt > 0 ? Math.max(0, Math.min(100, 100 - ((cur.idle - prev.idle) / totalDt) * 100)) : 0;
+    prev = cur;
+    const memTotal = os.totalmem();
+    broadcastMetrics({
+      cpu: Math.round(cpu),
+      memUsed: memTotal - os.freemem(),
+      memTotal,
+      diskPct: perfSample.diskPct,
+      diskBytes: perfSample.diskBytes,
+      netUp: perfSample.netUp,
+      netDown: perfSample.netDown,
+      gpu: perfSample.gpu,
+    });
+  }, 2000);
+}
+
 function createPetWindows() {
   const geo = deskGeometry();
   const area = geo.hull;
@@ -668,6 +804,32 @@ app.whenReady().then(() => {
   }
 
   createPetWindows();
+
+  // 监控底座：PowerShell 性能计数器子进程（仅 Windows）+ 2s 指标广播
+  startPerfWorker();
+  startMetricsLoop();
+
+  // 底座点击：打开系统任务管理器。
+  // 必须走 ShellExecute（shell.openPath）——taskmgr.exe 是带提升清单的系统组件，
+  // CreateProcess 直拉会 EACCES（实测 spawn('taskmgr.exe') 直接报拒绝访问）。
+  ipcMain.on('pet:open-taskmgr', () => {
+    // Electron 31+ 的 shell.openPath 返回 Promise<string>：resolve 值非空才是错误信息
+    const target =
+      process.platform === 'win32'
+        ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskmgr.exe')
+        : process.platform === 'darwin'
+          ? '/System/Applications/Utilities/Activity Monitor.app'
+          : '';
+    if (!target) return;
+    shell
+      .openPath(target)
+      .then((err) => {
+        if (err) console.error('[dsh-pet-desktop-helper] open task manager failed:', String(err));
+      })
+      .catch((e) => {
+        console.error('[dsh-pet-desktop-helper] open task manager failed:', String(e && e.message ? e.message : e));
+      });
+  });
 
   // 宠物窗口跟随：renderer 逐帧上报窗口内容区位置/尺寸
   ipcMain.on('pet:set-bounds', (event, bounds) => {

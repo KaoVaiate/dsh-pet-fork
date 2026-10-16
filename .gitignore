@@ -28,6 +28,8 @@ node_modules/
 .npm-tmp-cache/
 npm-debug.log*
 *.tgz
+# 项目用 pnpm（pnpm-lock.yaml 为规范锁文件）；npm 误生成的冗余锁文件不入库
+dsh-pet/package-lock.json
 
 # ── 临时/备份目录 ──
 temp/
